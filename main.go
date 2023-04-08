@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"time"
@@ -16,7 +18,45 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-var jwtSecret = []byte("my-secret-key") // Clave secreta para JWT
+var jwtSecret = []byte(`-----BEGIN RSA PRIVATE KEY-----
+MIICXQIBAAKBgQDDo9KAQ+DUi2Xqi5SqkqSkhP3/T0rofHL4LdRn8lAb6nJ5gy2L
+Ca64KyYky1VrR4CZH286cQDHUiuqSmtRAxyds0I+qtqMDiiclv3imW9TMVOCxVCP
+JVJv0DyGgGHwbOgvA2vdR5i/TSqRDqua0qAl/dBXJyqgV9pMjzQGDfgKswIDAQAB
+AoGAWTZSHjVVx/ZNIjhGMcYvF+qhXJQO55cgYjWb306q4x/01Z5Q3U8sAkWC3lJu
+gD4Z0Tl5Yh/3p+y7hqrq5wVRPXcniwGrepEdgyObJ54U4SW7k4XHaRKUlYGmG5jl
+960TYPGNAPjDSTfy8X4lktMRMQPu6u53W07Aoq3POD+Jr5kCQQD45tthShRlF40l
+KfW+S4Hhhe62HkQszNfZnRiIFoPzhCuGUUgqlWw7DQXoOHw84YO/ZlMI6uWez6nq
+WmaOOMBVAkEAyTgemhudQJNo2Udpk9KBbUx5tO9vZx0yawGNjaZHuZXIbPCe8wT4
+J+6bELvfSLV+MkAwSmWCFRXladavMb6G5wJBAN6PRvEKlYwDcCEgEO4UhFGNOfM8
+wwcwL34Ve78MKvbPYz/aZGY3cCypK3QHNggWOoEl1O+vYp0L4Up9hSB83HUCQCi3
+J1INlmMzsLqOfamApdnE6LeY31ThDouic88ev1KpITYR9ke8UK5b1JqtOUAQIWnv
+nRXgtlKn7JTe8PJC2C8CQQC0cHFdQEGeYpbNbJG57oQgLK1afdBOYuc5E8wgsl9x
++d7ZCcc93ltHw+Owv6Qh6IMYt8yaoPtVHZpmkzqQcugI
+-----END RSA PRIVATE KEY-----`) // Clave secreta para JWT
+
+var (
+	privateKey *rsa.PrivateKey
+	publicKey  *rsa.PublicKey
+)
+
+func init() {
+	privateBytes, err := ioutil.ReadFile("private.rsa")
+	if err != nil {
+		log.Fatal("Cannot read private key file")
+	}
+	publicBytes, err := ioutil.ReadFile("public.rsa.pub")
+	if err != nil {
+		log.Fatal("Cannot read public key file")
+	}
+	privateKey, err = jwt.ParseRSAPrivateKeyFromPEM(privateBytes)
+	if err != nil {
+		log.Fatal("Cannot parce private key")
+	}
+	publicKey, err = jwt.ParseRSAPublicKeyFromPEM(publicBytes)
+	if err != nil {
+		log.Fatal("Cannot parce private key")
+	}
+}
 
 func main() {
 	router := mux.NewRouter()
@@ -26,6 +66,9 @@ func main() {
 
 	// Endpoint para iniciar sesión
 	router.HandleFunc("/login", iniciarSesion).Methods("POST")
+
+	// Endopoint para validar token
+	router.HandleFunc("/validate", validateToken).Methods("GET")
 
 	// Endpoint para olvidar contraseña
 	//router.HandleFunc("/forgot", ForgotPassword).Methods("POST")
@@ -99,6 +142,29 @@ func crearUsuario(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Conecta a la base de datos
+	client, err := conectarMongoDB()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Disconnect(context.Background())
+
+	collection := client.Database(mongoDBConfig().DBName).Collection(mongoDBConfig().CollectionName)
+	filter := bson.M{"email": usuario.Email}
+
+	var existingUser Usuario
+	err = collection.FindOne(context.Background(), filter).Decode(&existingUser)
+
+	if err == nil {
+		// El correo electrónico ya existe en la base de datos
+		respondWithError(w, http.StatusConflict, "El correo electrónico ya está registrado")
+		return
+	} else if err != mongo.ErrNoDocuments {
+		// Ocurrió un error al buscar en la base de datos
+		respondWithError(w, http.StatusConflict, "Error, intentelo más tarde")
+		return
+	}
+
 	// Encripta la contraseña antes de guardarla en la base de datos
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(usuario.Password), bcrypt.DefaultCost)
 	if err != nil {
@@ -107,15 +173,8 @@ func crearUsuario(w http.ResponseWriter, r *http.Request) {
 
 	usuario.Password = string(hashedPassword)
 
-	// Conecta a la base de datos
-	client, err := conectarMongoDB()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer client.Disconnect(context.Background())
-
 	// Inserta el usuario en la colección
-	collection := client.Database(mongoDBConfig().DBName).Collection(mongoDBConfig().CollectionName)
+
 	result, err := collection.InsertOne(context.Background(), usuario)
 	if err != nil {
 		log.Fatal(err)
@@ -161,7 +220,7 @@ func iniciarSesion(w http.ResponseWriter, r *http.Request) {
 	// Genera un nuevo token JWT
 	token, err := generarTokenJWT(resultado.ID)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Error al generar el token JWT")
+		respondWithError(w, http.StatusInternalServerError, "Error al generar el token JWT "+err.Error())
 		return
 	}
 
@@ -184,6 +243,44 @@ func generarTokenJWT(userID string) (string, error) {
 	}
 
 	return tokenString, nil
+}
+
+// Función para validar un token JWT
+func validateToken_(tokenString string) (bool, error) {
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		return jwtSecret, nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	if _, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		return true, nil
+	} else {
+		return false, nil
+	}
+}
+
+func validateToken(w http.ResponseWriter, r *http.Request) {
+
+	tokenString := r.Header.Get("Authorization")
+	if tokenString == "" {
+		respondWithError(w, http.StatusUnauthorized, "Token de autenticación requerido")
+		return
+	}
+	valid, err := validateToken_(tokenString)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Error al validar el token")
+		return
+	}
+
+	if !valid {
+		respondWithError(w, http.StatusUnauthorized, "Token invalido")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, map[string]string{"message": "Bienvenido al sistema"})
+
 }
 
 // Decodifica el cuerpo de una solicitud HTTP en formato JSON y lo asigna a una estructura dada
